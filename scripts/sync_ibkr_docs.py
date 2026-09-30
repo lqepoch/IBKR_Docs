@@ -166,7 +166,8 @@ def normalize_page_url(
 ) -> str | None:
     """Return a canonical in-scope page URL, or None for an out-of-scope link."""
 
-    value = html.unescape(raw.strip()).strip("<>"'")
+    value = html.unescape(raw.strip()).strip("<>")
+    value = value.strip(chr(34)).strip(chr(39))
     if not value or value.startswith(("#", "mailto:", "javascript:", "data:")):
         return None
 
