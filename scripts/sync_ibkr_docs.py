@@ -46,10 +46,6 @@ SOURCE_PATH = META_ROOT / "source.json"
 # the mirror still works when only the root index exists.
 INDEX_URLS = (
     f"{BASE_URL}/llms.txt",
-    f"{BASE_URL}/docs/tws-api/llms.txt",
-    f"{BASE_URL}/docs/tws-api/doc/llms.txt",
-    f"{BASE_URL}/docs/tws-api/ref/llms.txt",
-    f"{BASE_URL}/docs/tws-api/protobuf/llms.txt",
 )
 
 # Seeds provide redundancy if an upstream index temporarily omits a section.

@@ -45,14 +45,16 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Sync official IBKR documentation
+        shell: bash
         run: |
+          set -euo pipefail
           python scripts/sync_ibkr_docs.py sync \
             --timeout 30 \
             --request-delay 0.05 \
             --minimum-pages 50 \
             | tee /tmp/ibkr-sync-result.json
 
-      - name: Validate committed mirror model
+      - name: Validate mirrored working tree
         run: python scripts/sync_ibkr_docs.py validate --minimum-pages 50
 
       - name: Validate Git diff
