@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Mirror the official IBKR TWS API Markdown documentation into this repository.
+"""Mirror official IBKR TWS API Markdown documentation into this repository.
 
-The mirror preserves the upstream URL path exactly beneath the repository root:
+Storage is deterministic and preserves the upstream path:
 
     https://ibkrcampus.com/docs/tws-api/doc/introduction
     -> docs/tws-api/doc/introduction.md
 
-Only pages under /docs/tws-api are mirrored. The script discovers pages from the
-IBKR llms.txt indexes, follows in-scope links found in mirrored Markdown pages,
-verifies completeness, and atomically replaces the local mirror only after a
-successful crawl.
+The crawler is fail-closed: it builds a complete temporary mirror, validates
+coverage and hashes, and only then makes the working-tree changes that the
+GitHub Actions workflow may commit.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ from typing import Iterable
 
 BASE_URL = "https://ibkrcampus.com"
 UPSTREAM_PREFIX = "/docs/tws-api"
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIRROR_ROOT = REPO_ROOT / "docs" / "tws-api"
 META_ROOT = REPO_ROOT / ".meta"
@@ -42,14 +42,17 @@ MANIFEST_PATH = META_ROOT / "manifest.json"
 CATALOG_PATH = META_ROOT / "catalog.txt"
 SOURCE_PATH = META_ROOT / "source.json"
 
+# IBKR documents the root llms.txt index. Scoped indexes are opportunistic:
+# the mirror still works when only the root index exists.
 INDEX_URLS = (
+    f"{BASE_URL}/llms.txt",
     f"{BASE_URL}/docs/tws-api/llms.txt",
     f"{BASE_URL}/docs/tws-api/doc/llms.txt",
     f"{BASE_URL}/docs/tws-api/ref/llms.txt",
     f"{BASE_URL}/docs/tws-api/protobuf/llms.txt",
-    f"{BASE_URL}/llms.txt",
 )
 
+# Seeds provide redundancy if an upstream index temporarily omits a section.
 SEED_PAGES = (
     f"{BASE_URL}/docs/tws-api/doc/introduction",
     f"{BASE_URL}/docs/tws-api/ref/contract",
@@ -79,6 +82,7 @@ USER_AGENT = (
     "IBKR_Docs-Mirror/1.0 "
     "(+https://github.com/lqepoch/IBKR_Docs; weekly documentation mirror)"
 )
+
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_DELAY = 0.05
 DEFAULT_MAX_PAGES = 5000
@@ -101,7 +105,7 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _retry_delay(attempt: int, retry_after: str | None) -> float:
+def retry_delay(attempt: int, retry_after: str | None) -> float:
     if retry_after:
         try:
             return min(max(float(retry_after), 1.0), 60.0)
@@ -117,7 +121,7 @@ def fetch_text(
     max_bytes: int = 8 * 1024 * 1024,
     attempts: int = 5,
 ) -> FetchResult:
-    """Fetch UTF-8-ish text with bounded retries and response size."""
+    """Fetch text with bounded retries, size limits, and redirect validation."""
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -132,9 +136,11 @@ def fetch_text(
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 final_url = response.geturl()
-                host = urllib.parse.urlsplit(final_url).hostname or ""
-                if host.lower() not in {"ibkrcampus.com", "www.ibkrcampus.com"}:
-                    raise SyncError(f"unexpected redirect host for {url}: {host}")
+                host = (urllib.parse.urlsplit(final_url).hostname or "").lower()
+                if host not in {"ibkrcampus.com", "www.ibkrcampus.com"}:
+                    raise SyncError(
+                        f"unexpected redirect host for {url}: {host or '<empty>'}"
+                    )
 
                 payload = response.read(max_bytes + 1)
                 if len(payload) > max_bytes:
@@ -151,10 +157,10 @@ def fetch_text(
             last_error = exc
             if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
                 raise
-            time.sleep(_retry_delay(attempt, exc.headers.get("Retry-After")))
+            time.sleep(retry_delay(attempt, exc.headers.get("Retry-After")))
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             last_error = exc
-            time.sleep(_retry_delay(attempt, None))
+            time.sleep(retry_delay(attempt, None))
 
     raise SyncError(f"failed after {attempts} attempts: {url}: {last_error}")
 
@@ -164,16 +170,12 @@ def normalize_page_url(
     *,
     base_url: str = BASE_URL + UPSTREAM_PREFIX + "/",
 ) -> str | None:
-    """Return a canonical in-scope page URL, or None for an out-of-scope link."""
+    """Normalize an in-scope documentation page URL."""
 
     value = html.unescape(raw.strip()).strip("<>")
     value = value.strip(chr(34)).strip(chr(39))
     if not value or value.startswith(("#", "mailto:", "javascript:", "data:")):
         return None
-
-    # Markdown links may carry an optional quoted title after the URL.
-    if " " in value and not value.startswith(("http://", "https://")):
-        value = value.split(" ", 1)[0]
 
     joined = urllib.parse.urljoin(base_url, value)
     parsed = urllib.parse.urlsplit(joined)
@@ -183,6 +185,7 @@ def normalize_page_url(
 
     path = urllib.parse.unquote(parsed.path)
     path = posixpath.normpath("/" + path.lstrip("/"))
+
     if path != UPSTREAM_PREFIX and not path.startswith(UPSTREAM_PREFIX + "/"):
         return None
 
@@ -202,6 +205,20 @@ def normalize_page_url(
     return BASE_URL + path.rstrip("/")
 
 
+def markdown_link_target(value: str) -> str:
+    """Strip the optional Markdown title from a link target."""
+
+    target = value.strip()
+    if target.startswith("<") and ">" in target:
+        return target[1 : target.index(">")]
+
+    # Markdown permits URL plus a quoted title: url "title" or url 'title'.
+    for marker in (' "', " '"):
+        if marker in target:
+            return target.split(marker, 1)[0]
+    return target
+
+
 def extract_in_scope_links(
     text: str,
     *,
@@ -211,23 +228,16 @@ def extract_in_scope_links(
 
     candidates: set[str] = set()
 
-    for match in re.finditer(r"[[^]]*](([^)]+))", text):
-        target = match.group(1).strip()
-        if target.startswith("<") and ">" in target:
-            target = target[1 : target.index(">")]
-        elif " "" in target:
-            target = target.split(" "", 1)[0]
-        elif " '" in target:
-            target = target.split(" '", 1)[0]
-        candidates.add(target)
+    for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", text):
+        candidates.add(markdown_link_target(match.group(1)))
 
     candidates.update(
         match.rstrip(".,;:)]}>")
-        for match in re.findall(r"https?://[^s<>"']+", text)
+        for match in re.findall(r"https?://[^\s<>\"']+", text)
     )
     candidates.update(
         match.rstrip(".,;:)]}>")
-        for match in re.findall(r"/docs/tws-api/[A-Za-z0-9_./%+-]+", text)
+        for match in re.findall(r"/docs/tws-api/[A-Za-z0-9_./%+\-]+", text)
     )
 
     normalized: set[str] = set()
@@ -247,11 +257,11 @@ def local_relative_path(canonical_url: str) -> Path:
     path = posixpath.normpath("/" + parsed.path.lstrip("/"))
     if not path.startswith(UPSTREAM_PREFIX + "/"):
         raise SyncError(f"URL is outside mirror scope: {canonical_url}")
-    rel = path.lstrip("/") + ".md"
-    result = Path(rel)
-    if result.is_absolute() or ".." in result.parts:
-        raise SyncError(f"unsafe local path derived from {canonical_url}: {result}")
-    return result
+
+    relative = Path(path.lstrip("/") + ".md")
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SyncError(f"unsafe local path from {canonical_url}: {relative}")
+    return relative
 
 
 def looks_like_markdown(text: str, content_type: str) -> bool:
@@ -278,6 +288,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> dict | None:
 def manifest_hash_map(manifest: dict | None) -> dict[str, str]:
     if not manifest:
         return {}
+
     result: dict[str, str] = {}
     for item in manifest.get("documents", []):
         path = item.get("path")
@@ -310,18 +321,19 @@ def validate_thresholds(documents: list[dict], minimum_pages: int) -> None:
 
     counts = category_counts(documents)
     required = {"doc": 10, "ref": 10, "protobuf": 3}
-    missing = [
+    failures = [
         f"{name}={counts[name]} (<{minimum})"
         for name, minimum in required.items()
         if counts[name] < minimum
     ]
-    if missing:
-        raise SyncError("category completeness gate failed: " + ", ".join(missing))
+    if failures:
+        raise SyncError("category completeness gate failed: " + ", ".join(failures))
 
 
 def validate_removal_guard(
     old_manifest: dict | None,
     new_manifest: dict,
+    *,
     max_removal_ratio: float,
     allow_mass_removal: bool,
 ) -> None:
@@ -331,9 +343,9 @@ def validate_removal_guard(
         return
 
     removed = set(old) - set(new)
-    ratio = len(removed) / len(old)
     hard_limit = max(5, int(len(old) * max_removal_ratio))
-    if removed and len(removed) > hard_limit and not allow_mass_removal:
+    if len(removed) > hard_limit and not allow_mass_removal:
+        ratio = len(removed) / len(old)
         sample = ", ".join(sorted(removed)[:5])
         raise SyncError(
             "mass-removal guard blocked publication: "
@@ -358,9 +370,41 @@ def deterministic_manifest(documents: list[dict]) -> dict:
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "
-",
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
+    )
+
+
+def publish_stage(stage_root: Path, manifest: dict) -> None:
+    """Materialize validated staged data into the git working tree."""
+
+    stage_mirror = stage_root / "docs" / "tws-api"
+    if not stage_mirror.is_dir():
+        raise SyncError("staged mirror directory is missing")
+
+    if MIRROR_ROOT.exists():
+        shutil.rmtree(MIRROR_ROOT)
+    MIRROR_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(stage_mirror), str(MIRROR_ROOT))
+
+    write_json(MANIFEST_PATH, manifest)
+    CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CATALOG_PATH.write_text(
+        "".join(item["path"] + "\n" for item in manifest["documents"]),
+        encoding="utf-8",
+    )
+    write_json(
+        SOURCE_PATH,
+        {
+            "schema_version": 1,
+            "upstream": BASE_URL,
+            "scope": UPSTREAM_PREFIX,
+            "discovery_indexes": list(INDEX_URLS),
+            "storage_rule": (
+                "Preserve the official URL path under the repository root "
+                "and append .md"
+            ),
+        },
     )
 
 
@@ -372,7 +416,7 @@ def sync(
     minimum_pages: int,
     max_removal_ratio: float,
 ) -> dict:
-    """Crawl the official Markdown docs and publish a validated local mirror."""
+    """Crawl official Markdown docs and update the working tree if needed."""
 
     discovered: set[str] = set(SEED_PAGES)
     successful_indexes: list[str] = []
@@ -380,12 +424,20 @@ def sync(
 
     for index_url in INDEX_URLS:
         try:
-            result = fetch_text(index_url, timeout=timeout, max_bytes=24 * 1024 * 1024)
+            result = fetch_text(
+                index_url,
+                timeout=timeout,
+                max_bytes=24 * 1024 * 1024,
+            )
         except urllib.error.HTTPError as exc:
             if exc.code in {404, 410}:
-                unavailable_indexes.append({"url": index_url, "reason": f"HTTP {exc.code}"})
+                unavailable_indexes.append(
+                    {"url": index_url, "reason": f"HTTP {exc.code}"}
+                )
                 continue
-            raise SyncError(f"index fetch failed: {index_url}: HTTP {exc.code}") from exc
+            raise SyncError(
+                f"index fetch failed: {index_url}: HTTP {exc.code}"
+            ) from exc
         except Exception as exc:
             unavailable_indexes.append({"url": index_url, "reason": str(exc)})
             continue
@@ -399,15 +451,19 @@ def sync(
     queue = deque(sorted(discovered))
     queued = set(queue)
     documents: list[dict] = []
-    missing_pages: list[dict[str, str]] = []
+    stale_index_pages: list[dict[str, str]] = []
 
-    with tempfile.TemporaryDirectory(prefix=".ibkr-docs-stage-", dir=REPO_ROOT) as temp_dir:
-        temp_root = Path(temp_dir)
-        stage_mirror = temp_root / "docs" / "tws-api"
+    with tempfile.TemporaryDirectory(
+        prefix=".ibkr-docs-stage-",
+        dir=REPO_ROOT,
+    ) as temp_dir:
+        stage_root = Path(temp_dir)
 
         while queue:
-            if len(documents) + len(missing_pages) >= max_pages:
-                raise SyncError(f"page limit {max_pages} reached; refusing partial mirror")
+            if len(documents) + len(stale_index_pages) >= max_pages:
+                raise SyncError(
+                    f"page limit {max_pages} reached; refusing a partial mirror"
+                )
 
             canonical_url = queue.popleft()
             relative_path = local_relative_path(canonical_url)
@@ -417,16 +473,22 @@ def sync(
                 result = fetch_text(md_url, timeout=timeout)
             except urllib.error.HTTPError as exc:
                 if exc.code in {404, 410}:
-                    missing_pages.append({"url": canonical_url, "reason": f"HTTP {exc.code}"})
+                    stale_index_pages.append(
+                        {"url": canonical_url, "reason": f"HTTP {exc.code}"}
+                    )
                     continue
-                raise SyncError(f"document fetch failed: {md_url}: HTTP {exc.code}") from exc
+                raise SyncError(
+                    f"document fetch failed: {md_url}: HTTP {exc.code}"
+                ) from exc
 
             if not looks_like_markdown(result.text, result.content_type):
-                raise SyncError(f"expected Markdown but received unexpected content: {md_url}")
+                raise SyncError(
+                    f"expected Markdown but received unexpected content: {md_url}"
+                )
             if len(result.text.strip()) < 16:
                 raise SyncError(f"unexpectedly short document: {md_url}")
 
-            target = temp_root / relative_path
+            target = stage_root / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(result.text, encoding="utf-8")
 
@@ -454,55 +516,32 @@ def sync(
         manifest = deterministic_manifest(documents)
         old_manifest = load_manifest()
 
-        allow_mass_removal = os.environ.get("IBKR_DOCS_ALLOW_MASS_REMOVAL") == "1"
         validate_removal_guard(
             old_manifest,
             manifest,
             max_removal_ratio=max_removal_ratio,
-            allow_mass_removal=allow_mass_removal,
+            allow_mass_removal=os.environ.get(
+                "IBKR_DOCS_ALLOW_MASS_REMOVAL"
+            ) == "1",
         )
 
-        old_hashes = manifest_hash_map(old_manifest)
-        new_hashes = manifest_hash_map(manifest)
-        changed = old_hashes != new_hashes
-
+        changed = manifest_hash_map(old_manifest) != manifest_hash_map(manifest)
         if changed:
-            if MIRROR_ROOT.exists():
-                shutil.rmtree(MIRROR_ROOT)
-            MIRROR_ROOT.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(stage_mirror), str(MIRROR_ROOT))
+            publish_stage(stage_root, manifest)
 
-            write_json(MANIFEST_PATH, manifest)
-            CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CATALOG_PATH.write_text(
-                "".join(item["path"] + "
-" for item in manifest["documents"]),
-                encoding="utf-8",
-            )
-            write_json(
-                SOURCE_PATH,
-                {
-                    "schema_version": 1,
-                    "upstream": BASE_URL,
-                    "scope": UPSTREAM_PREFIX,
-                    "discovery_indexes": list(INDEX_URLS),
-                    "storage_rule": (
-                        "Preserve the official URL path under the repository root and append .md"
-                    ),
-                },
-            )
-
-        return {
-            "changed": changed,
-            "document_count": len(documents),
-            "category_counts": manifest["category_counts"],
-            "successful_indexes": successful_indexes,
-            "unavailable_indexes": unavailable_indexes,
-            "stale_index_pages": missing_pages,
-        }
+    return {
+        "changed": changed,
+        "document_count": len(documents),
+        "category_counts": manifest["category_counts"],
+        "successful_indexes": successful_indexes,
+        "unavailable_indexes": unavailable_indexes,
+        "stale_index_pages": stale_index_pages,
+    }
 
 
 def validate_existing(*, minimum_pages: int = DEFAULT_MIN_PAGES) -> dict:
+    """Validate the committed mirror against its manifest."""
+
     manifest = load_manifest()
     if not manifest:
         raise SyncError(f"manifest is missing: {MANIFEST_PATH}")
@@ -512,28 +551,33 @@ def validate_existing(*, minimum_pages: int = DEFAULT_MIN_PAGES) -> dict:
         raise SyncError("manifest documents must be a list")
 
     validate_thresholds(documents, minimum_pages)
-    expected_paths = set()
+    expected_paths: set[str] = set()
 
     for item in documents:
         relative = item.get("path")
         expected_sha = item.get("sha256")
         expected_bytes = item.get("bytes")
-        if not isinstance(relative, str) or not relative.startswith("docs/tws-api/"):
+
+        if not isinstance(relative, str) or not relative.startswith(
+            "docs/tws-api/"
+        ):
             raise SyncError(f"unsafe or invalid manifest path: {relative!r}")
 
         path = REPO_ROOT / relative
         if path.is_symlink():
-            raise SyncError(f"symlink is not allowed in the mirror: {relative}")
+            raise SyncError(f"symlink is not allowed in mirror: {relative}")
         if not path.is_file():
             raise SyncError(f"mirrored file is missing: {relative}")
 
         text = path.read_text(encoding="utf-8")
         actual_sha = sha256_text(text)
         actual_bytes = len(text.encode("utf-8"))
+
         if actual_sha != expected_sha:
             raise SyncError(f"SHA-256 mismatch: {relative}")
         if actual_bytes != expected_bytes:
             raise SyncError(f"byte-count mismatch: {relative}")
+
         expected_paths.add(relative)
 
     actual_paths = {
@@ -545,13 +589,13 @@ def validate_existing(*, minimum_pages: int = DEFAULT_MIN_PAGES) -> dict:
     missing = expected_paths - actual_paths
     if extras or missing:
         raise SyncError(
-            f"manifest/file-set mismatch: extras={sorted(extras)[:5]}, missing={sorted(missing)[:5]}"
+            "manifest/file-set mismatch: "
+            f"extras={sorted(extras)[:5]}, missing={sorted(missing)[:5]}"
         )
 
-    expected_count = manifest.get("document_count")
-    if expected_count != len(documents):
+    if manifest.get("document_count") != len(documents):
         raise SyncError(
-            f"manifest document_count={expected_count!r}, actual={len(documents)}"
+            "manifest document_count does not match the document list length"
         )
 
     return {
@@ -570,9 +614,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="download and publish the official mirror",
     )
     sync_parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    sync_parser.add_argument("--request-delay", type=float, default=DEFAULT_DELAY)
+    sync_parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=DEFAULT_DELAY,
+    )
     sync_parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
-    sync_parser.add_argument("--minimum-pages", type=int, default=DEFAULT_MIN_PAGES)
+    sync_parser.add_argument(
+        "--minimum-pages",
+        type=int,
+        default=DEFAULT_MIN_PAGES,
+    )
     sync_parser.add_argument(
         "--max-removal-ratio",
         type=float,
@@ -583,12 +635,17 @@ def build_parser() -> argparse.ArgumentParser:
         "validate",
         help="validate the committed mirror",
     )
-    validate_parser.add_argument("--minimum-pages", type=int, default=DEFAULT_MIN_PAGES)
+    validate_parser.add_argument(
+        "--minimum-pages",
+        type=int,
+        default=DEFAULT_MIN_PAGES,
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
     try:
         if args.command == "sync":
             result = sync(
