@@ -105,6 +105,24 @@ class LinkExtractionTests(unittest.TestCase):
             },
         )
 
+    def test_canonicalize_hrefs_filters_and_canonicalizes(self) -> None:
+        hrefs = [
+            "https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
+            "https://ibkrcampus.com/docs/tws-api/ref/order.md",
+            "https://www.interactivebrokers.com/docs/web-api/introduction",
+            "https://example.com/docs/tws-api/ref/order",
+        ]
+        self.assertEqual(
+            sync.canonicalize_hrefs(
+                hrefs,
+                base_url="https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
+            ),
+            {
+                "https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
+                "https://www.interactivebrokers.com/docs/tws-api/ref/order",
+            },
+        )
+
     def test_local_path_preserves_upstream_tree(self) -> None:
         self.assertEqual(
             sync.local_relative_path(

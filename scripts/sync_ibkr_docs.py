@@ -632,6 +632,99 @@ def discover_from_sitemaps(
     return pages, warnings
 
 
+def canonicalize_hrefs(
+    hrefs: Iterable[str],
+    *,
+    base_url: str,
+) -> set[str]:
+    """Canonicalize browser-discovered hrefs into the TWS API namespace."""
+
+    result: set[str] = set()
+    for href in hrefs:
+        page = normalize_page_url(str(href), base_url=base_url)
+        if page:
+            result.add(page)
+    return result
+
+
+def discover_from_rendered_navigation(
+    *,
+    timeout: float,
+) -> tuple[set[str], list[dict[str, str]]]:
+    """Discover the client-rendered Fern navigation with headless Chromium."""
+
+    pages: set[str] = set()
+    warnings: list[dict[str, str]] = []
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return pages, [{"url": "playwright://chromium", "reason": str(exc)}]
+
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale="en-US",
+                viewport={"width": 1600, "height": 1000},
+            )
+
+            for seed in SEED_PAGES:
+                page = context.new_page()
+                try:
+                    page.goto(
+                        seed,
+                        wait_until="domcontentloaded",
+                        timeout=max(5_000, int(timeout * 1000)),
+                    )
+                    try:
+                        page.wait_for_load_state(
+                            "networkidle",
+                            timeout=min(15_000, max(5_000, int(timeout * 1000))),
+                        )
+                    except Exception:
+                        # Documentation hydration can keep background requests open.
+                        page.wait_for_timeout(2_500)
+
+                    hrefs = page.eval_on_selector_all(
+                        "a[href]",
+                        "els => els.map(el => el.href)",
+                    )
+                    pages.update(
+                        canonicalize_hrefs(
+                            (str(href) for href in hrefs),
+                            base_url=seed,
+                        )
+                    )
+
+                    # Client frameworks sometimes keep route data in the hydrated DOM
+                    # without rendering every navigation link simultaneously.
+                    pages.update(
+                        extract_html_links(
+                            page.content(),
+                            base_url=seed,
+                        )
+                    )
+                except Exception as exc:
+                    warnings.append({"url": seed, "reason": str(exc)})
+                finally:
+                    page.close()
+
+            context.close()
+    except Exception as exc:
+        warnings.append({"url": "playwright://chromium", "reason": str(exc)})
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    return pages, warnings
+
+
 def bootstrap_discovery(*, timeout: float) -> tuple[set[str], list[dict[str, str]]]:
     """Discover the full navigation tree from canonical HTML and optional indexes."""
 
@@ -641,6 +734,18 @@ def bootstrap_discovery(*, timeout: float) -> tuple[set[str], list[dict[str, str
     sitemap_pages, sitemap_warnings = discover_from_sitemaps(timeout=timeout)
     discovered.update(sitemap_pages)
     warnings.extend(sitemap_warnings)
+
+    rendered_pages, rendered_warnings = discover_from_rendered_navigation(
+        timeout=timeout
+    )
+    discovered.update(rendered_pages)
+    warnings.extend(rendered_warnings)
+
+    print(
+        f"Rendered navigation discovered {len(rendered_pages)} TWS API pages; "
+        f"warnings={len(rendered_warnings)}",
+        file=sys.stderr,
+    )
 
     for index_url in INDEX_URLS:
         try:
