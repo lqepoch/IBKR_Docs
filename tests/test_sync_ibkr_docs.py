@@ -85,6 +85,26 @@ class LinkExtractionTests(unittest.TestCase):
             },
         )
 
+    def test_extracts_routes_from_embedded_payloads(self) -> None:
+        html_value = r"""
+        <script>
+          {"route":"\\/docs\\/tws-api\\/doc\\/orders\\/place-order"}
+        </script>
+        <script>
+          {"route":"\\u002Fdocs\\u002Ftws-api\\u002Fref\\u002Forder"}
+        </script>
+        """
+        self.assertEqual(
+            sync.extract_html_links(
+                html_value,
+                base_url="https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
+            ),
+            {
+                "https://www.interactivebrokers.com/docs/tws-api/doc/orders/place-order",
+                "https://www.interactivebrokers.com/docs/tws-api/ref/order",
+            },
+        )
+
     def test_local_path_preserves_upstream_tree(self) -> None:
         self.assertEqual(
             sync.local_relative_path(

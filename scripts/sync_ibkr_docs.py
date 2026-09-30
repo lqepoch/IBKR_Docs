@@ -277,12 +277,37 @@ def extract_html_links(
     *,
     base_url: str,
 ) -> set[str]:
+    """Extract TWS API routes from anchors and embedded Fern/Next payloads."""
+
     soup = parse_html(html_text)
     result: set[str] = set()
+
     for anchor in soup.find_all("a", href=True):
         page = normalize_page_url(str(anchor.get("href")), base_url=base_url)
         if page:
             result.add(page)
+
+    # Fern-generated navigation can be hydrated client-side. The initial HTML
+    # still carries route strings inside serialized JSON/script payloads, so
+    # scan those payloads as an additional discovery source.
+    normalized_payloads = {
+        html_text,
+        html.unescape(html_text),
+        html_text.replace("\\/", "/"),
+        html_text.replace("\\u002F", "/").replace("\\u002f", "/"),
+    }
+
+    route_pattern = re.compile(
+        r"(?:https?://(?:www\\.)?(?:interactivebrokers\\.com|ibkrcampus\\.com))?"
+        r"/docs/tws-api/[A-Za-z0-9_./%+\\-]+"
+    )
+
+    for payload in normalized_payloads:
+        for match in route_pattern.findall(payload):
+            page = normalize_page_url(match, base_url=base_url)
+            if page:
+                result.add(page)
+
     return result
 
 
@@ -649,6 +674,11 @@ def sync(
     max_removal_ratio: float,
 ) -> dict:
     discovered, discovery_warnings = bootstrap_discovery(timeout=timeout)
+    print(
+        f"Discovery bootstrap found {len(discovered)} TWS API page candidates; "
+        f"warnings={len(discovery_warnings)}",
+        file=sys.stderr,
+    )
     prefer_markdown = detect_official_markdown(timeout=timeout)
 
     queue = deque(sorted(discovered))
