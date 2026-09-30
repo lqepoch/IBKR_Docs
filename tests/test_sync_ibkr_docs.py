@@ -94,6 +94,35 @@ class LinkExtractionTests(unittest.TestCase):
         )
 
 
+class SitemapTests(unittest.TestCase):
+    def test_urlset_filters_to_tws_api(self) -> None:
+        xml_value = """<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://www.interactivebrokers.com/docs/tws-api/doc/introduction</loc></url>
+          <url><loc>https://www.interactivebrokers.com/docs/web-api/introduction</loc></url>
+        </urlset>
+        """
+        pages, children = sync.parse_sitemap(xml_value)
+        self.assertEqual(
+            pages,
+            {"https://www.interactivebrokers.com/docs/tws-api/doc/introduction"},
+        )
+        self.assertEqual(children, set())
+
+    def test_sitemap_index_returns_children(self) -> None:
+        xml_value = """<?xml version="1.0" encoding="UTF-8"?>
+        <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <sitemap><loc>https://www.interactivebrokers.com/sitemap-docs.xml</loc></sitemap>
+        </sitemapindex>
+        """
+        pages, children = sync.parse_sitemap(xml_value)
+        self.assertEqual(pages, set())
+        self.assertEqual(
+            children,
+            {"https://www.interactivebrokers.com/sitemap-docs.xml"},
+        )
+
+
 class HtmlConversionTests(unittest.TestCase):
     def test_article_conversion_excludes_navigation(self) -> None:
         html_value = """

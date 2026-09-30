@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,10 @@ SOURCE_PATH = META_ROOT / "source.json"
 
 INDEX_URLS = (
     f"{BASE_URL}/llms.txt",
+)
+
+SITEMAP_URLS = (
+    f"{BASE_URL}/sitemap.xml",
 )
 
 SEED_PAGES = (
@@ -524,11 +529,92 @@ def publish_stage(stage_root: Path, manifest: dict) -> None:
     )
 
 
+def parse_sitemap(xml_text: str) -> tuple[set[str], set[str]]:
+    """Return (page URLs, child sitemap URLs) from sitemap XML."""
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise SyncError(f"invalid sitemap XML: {exc}") from exc
+
+    pages: set[str] = set()
+    child_sitemaps: set[str] = set()
+
+    root_name = root.tag.rsplit("}", 1)[-1].lower()
+
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].lower() != "loc":
+            continue
+
+        value = (element.text or "").strip()
+        if not value:
+            continue
+
+        parsed = urllib.parse.urlsplit(value)
+        host = (parsed.hostname or "").lower()
+        if host not in ALLOWED_HOSTS:
+            continue
+
+        if root_name == "sitemapindex":
+            child_sitemaps.add(value)
+            continue
+
+        page = normalize_page_url(value, base_url=BASE_URL + "/")
+        if page:
+            pages.add(page)
+
+    return pages, child_sitemaps
+
+
+def discover_from_sitemaps(
+    *,
+    timeout: float,
+    max_sitemaps: int = 200,
+) -> tuple[set[str], list[dict[str, str]]]:
+    """Discover TWS API pages from current IBKR sitemap indexes."""
+
+    pages: set[str] = set()
+    warnings: list[dict[str, str]] = []
+    queue = deque(SITEMAP_URLS)
+    seen: set[str] = set()
+
+    while queue:
+        sitemap_url = queue.popleft()
+        if sitemap_url in seen:
+            continue
+        seen.add(sitemap_url)
+
+        if len(seen) > max_sitemaps:
+            raise SyncError(
+                f"sitemap count exceeded safety limit {max_sitemaps}"
+            )
+
+        try:
+            result = fetch_text(
+                sitemap_url,
+                timeout=timeout,
+                max_bytes=32 * 1024 * 1024,
+            )
+            found_pages, children = parse_sitemap(result.text)
+            pages.update(found_pages)
+            for child in sorted(children):
+                if child not in seen:
+                    queue.append(child)
+        except Exception as exc:
+            warnings.append({"url": sitemap_url, "reason": str(exc)})
+
+    return pages, warnings
+
+
 def bootstrap_discovery(*, timeout: float) -> tuple[set[str], list[dict[str, str]]]:
     """Discover the full navigation tree from canonical HTML and optional indexes."""
 
     discovered: set[str] = set(SEED_PAGES)
     warnings: list[dict[str, str]] = []
+
+    sitemap_pages, sitemap_warnings = discover_from_sitemaps(timeout=timeout)
+    discovered.update(sitemap_pages)
+    warnings.extend(sitemap_warnings)
 
     for index_url in INDEX_URLS:
         try:
