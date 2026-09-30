@@ -290,16 +290,17 @@ def extract_html_links(
     # Fern-generated navigation can be hydrated client-side. The initial HTML
     # still carries route strings inside serialized JSON/script payloads, so
     # scan those payloads as an additional discovery source.
-    normalized_payloads = {
-        html_text,
-        html.unescape(html_text),
-        html_text.replace("\\/", "/"),
-        html_text.replace("\\u002F", "/").replace("\\u002f", "/"),
-    }
+    normalized_payloads = {html_text, html.unescape(html_text)}
+    payload = html_text
+    for _ in range(3):
+        payload = payload.replace("\\/", "/")
+        payload = re.sub(r"\\u002[fF]", "/", payload)
+        payload = html.unescape(payload)
+        normalized_payloads.add(payload)
 
     route_pattern = re.compile(
-        r"(?:https?://(?:www\\.)?(?:interactivebrokers\\.com|ibkrcampus\\.com))?"
-        r"/docs/tws-api/[A-Za-z0-9_./%+\\-]+"
+        r"(?:https?://(?:www\.)?(?:interactivebrokers\.com|ibkrcampus\.com))?"
+        r"/docs/tws-api/[A-Za-z0-9_./%+\-]+"
     )
 
     for payload in normalized_payloads:
