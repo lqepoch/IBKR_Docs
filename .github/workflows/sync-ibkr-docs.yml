@@ -1,0 +1,103 @@
+name: Sync IBKR TWS API Docs
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron is UTC. 01:17 UTC = 09:17 UTC+8 every Sunday.
+    - cron: "17 1 * * 0"
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/sync-ibkr-docs.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ibkr-docs-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Validate, sync, and commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Sync official IBKR documentation
+        run: |
+          python scripts/sync_ibkr_docs.py sync \
+            --timeout 30 \
+            --request-delay 0.05 \
+            --minimum-pages 50 \
+            | tee /tmp/ibkr-sync-result.json
+
+      - name: Validate committed mirror model
+        run: python scripts/sync_ibkr_docs.py validate --minimum-pages 50
+
+      - name: Validate Git diff
+        run: git diff --check
+
+      - name: Summarize result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## IBKR documentation sync"
+            echo
+            echo "- Upstream: https://ibkrcampus.com/docs/tws-api"
+            echo "- Repository path: `docs/tws-api/`"
+            echo "- Schedule: Sunday 01:17 UTC (09:17 UTC+8)"
+            echo
+            if [[ -f /tmp/ibkr-sync-result.json ]]; then
+              echo '```json'
+              cat /tmp/ibkr-sync-result.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit documentation changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -- docs/tws-api .meta/manifest.json .meta/catalog.txt .meta/source.json
+
+          if git diff --cached --quiet; then
+            echo "Official documentation is unchanged; nothing to commit."
+            exit 0
+          fi
+
+          # Fail closed if main moved while the mirror was being built. A later
+          # run can retry from the new HEAD without overwriting unrelated work.
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]]; then
+            echo "main moved during this run; refusing a non-fast-forward documentation commit." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "docs: sync IBKR TWS API ($(date -u +%F))"
+          git push origin HEAD:main
