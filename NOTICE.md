@@ -9,7 +9,7 @@ Interactive Brokers / IBKR. That mirrored content is not relicensed under the
 repository's MIT License. All rights in the upstream documentation remain with
 their respective rights holders. The official source is:
 
-https://ibkrcampus.com/docs/tws-api
+https://www.interactivebrokers.com/docs/tws-api
 
 This repository is an unofficial cache intended to provide stable local paths
 for development and automated tooling. The current official IBKR documentation

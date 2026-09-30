@@ -9,9 +9,9 @@ IBKR 官方 **TWS API / IB Gateway API** 文档的自动化 Markdown 镜像，�
 镜像严格保留 IBKR 官方 URL 的目录层级，只在文件末尾增加 `.md`。消费方可以长期依赖这些路径：
 
 ```text
-https://ibkrcampus.com/docs/tws-api/doc/...       -> docs/tws-api/doc/....md
-https://ibkrcampus.com/docs/tws-api/ref/...       -> docs/tws-api/ref/....md
-https://ibkrcampus.com/docs/tws-api/protobuf/...  -> docs/tws-api/protobuf/....md
+https://www.interactivebrokers.com/docs/tws-api/doc/...       -> docs/tws-api/doc/....md
+https://www.interactivebrokers.com/docs/tws-api/ref/...       -> docs/tws-api/ref/....md
+https://www.interactivebrokers.com/docs/tws-api/protobuf/...  -> docs/tws-api/protobuf/....md
 ```
 
 仓库结构：
@@ -46,9 +46,9 @@ GitHub Actions 每周日自动同步一次：
 
 也支持 `workflow_dispatch` 手工运行。同步流程会：
 
-1. 从 IBKR 官方 `llms.txt` 索引发现 TWS API 页面；
-2. 获取官方 `.md` Markdown 版本；
-3. 继续跟踪 Markdown 内部的 `/docs/tws-api/...` 链接，补齐索引可能遗漏的页面；
+1. 从 IBKR 官方 `llms.txt`、TWS API 当前站点导航和固定入口发现页面；
+2. 优先获取官方 `.md`；当 CI 网络无法访问 Markdown 端点时，从当前官方 HTML 页面确定性转换为 Markdown；
+3. 继续跟踪 `/docs/tws-api/...` 内部链接，补齐索引可能遗漏的页面；
 4. 在临时目录构建完整快照；
 5. 校验最小页面数量、`doc/ref/protobuf` 核心分区、路径安全、SHA-256 与文件集一致性；
 6. 对大比例删除执行 fail-closed 保护，降低上游临时异常导致仓库被清空的风险；
@@ -95,6 +95,7 @@ changing production trading semantics.
 
 ```bash
 python scripts/sync_ibkr_docs.py validate
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
@@ -107,4 +108,4 @@ python scripts/sync_ibkr_docs.py validate
 
 ## 数据来源与版权
 
-同步数据来自 `https://ibkrcampus.com/docs/tws-api`。自动化代码受本仓库 `LICENSE` 约束；`docs/` 下的镜像内容保持其原始权利归属，不因进入本仓库而重新授权为 MIT。详见 `NOTICE.md`。
+同步数据来自 `https://www.interactivebrokers.com/docs/tws-api`。自动化代码受本仓库 `LICENSE` 约束；`docs/` 下的镜像内容保持其原始权利归属，不因进入本仓库而重新授权为 MIT。详见 `NOTICE.md`。

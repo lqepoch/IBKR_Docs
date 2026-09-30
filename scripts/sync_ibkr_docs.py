@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Mirror official IBKR TWS API Markdown documentation into this repository.
+"""Mirror official IBKR TWS API documentation into this repository.
 
-Storage is deterministic and preserves the upstream path:
+The local layout preserves the official documentation URL path:
 
-    https://ibkrcampus.com/docs/tws-api/doc/introduction
+    https://www.interactivebrokers.com/docs/tws-api/doc/introduction
     -> docs/tws-api/doc/introduction.md
 
-The crawler is fail-closed: it builds a complete temporary mirror, validates
-coverage and hashes, and only then makes the working-tree changes that the
-GitHub Actions workflow may commit.
+The synchronizer prefers IBKR's official Markdown representation when it is
+reachable. If that representation is unavailable from the CI network, it
+fetches the canonical official HTML page and deterministically converts the
+article content to Markdown.
+
+Publication is fail-closed: pages are staged, coverage and hashes are checked,
+and only a validated working-tree snapshot is eligible for commit.
 """
 
 from __future__ import annotations
@@ -32,8 +36,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-BASE_URL = "https://ibkrcampus.com"
+from bs4 import BeautifulSoup
+from markdownify import markdownify as html_to_markdown
+
+BASE_URL = "https://www.interactivebrokers.com"
 UPSTREAM_PREFIX = "/docs/tws-api"
+UPSTREAM_ROOT = BASE_URL + UPSTREAM_PREFIX
+
+ALLOWED_HOSTS = {
+    "interactivebrokers.com",
+    "www.interactivebrokers.com",
+    "ibkrcampus.com",
+    "www.ibkrcampus.com",
+}
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIRROR_ROOT = REPO_ROOT / "docs" / "tws-api"
@@ -42,17 +57,14 @@ MANIFEST_PATH = META_ROOT / "manifest.json"
 CATALOG_PATH = META_ROOT / "catalog.txt"
 SOURCE_PATH = META_ROOT / "source.json"
 
-# IBKR documents the root llms.txt index. Scoped indexes are opportunistic:
-# the mirror still works when only the root index exists.
 INDEX_URLS = (
     f"{BASE_URL}/llms.txt",
 )
 
-# Seeds provide redundancy if an upstream index temporarily omits a section.
 SEED_PAGES = (
-    f"{BASE_URL}/docs/tws-api/doc/introduction",
-    f"{BASE_URL}/docs/tws-api/ref/contract",
-    f"{BASE_URL}/docs/tws-api/protobuf/introduction",
+    f"{UPSTREAM_ROOT}/doc/introduction",
+    f"{UPSTREAM_ROOT}/ref/introduction",
+    f"{UPSTREAM_ROOT}/protobuf/introduction",
 )
 
 NON_PAGE_SUFFIXES = {
@@ -75,8 +87,9 @@ NON_PAGE_SUFFIXES = {
 }
 
 USER_AGENT = (
-    "IBKR_Docs-Mirror/1.0 "
-    "(+https://github.com/lqepoch/IBKR_Docs; weekly documentation mirror)"
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0 Safari/537.36 "
+    "IBKR_Docs-Mirror/2.0"
 )
 
 DEFAULT_TIMEOUT = 30.0
@@ -97,6 +110,15 @@ class FetchResult:
     content_type: str
 
 
+@dataclass(frozen=True)
+class DocumentResult:
+    markdown: str
+    source_url: str
+    source_format: str
+    source_sha256: str
+    links: frozenset[str]
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -114,14 +136,14 @@ def fetch_text(
     url: str,
     *,
     timeout: float = DEFAULT_TIMEOUT,
-    max_bytes: int = 8 * 1024 * 1024,
+    max_bytes: int = 12 * 1024 * 1024,
     attempts: int = 5,
 ) -> FetchResult:
     """Fetch text with bounded retries, size limits, and redirect validation."""
 
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "text/markdown,text/plain;q=0.9,text/html;q=0.2,*/*;q=0.1",
+        "Accept": "text/markdown,text/plain;q=0.9,text/html;q=0.8,*/*;q=0.1",
         "Accept-Encoding": "identity",
         "Cache-Control": "no-cache",
     }
@@ -133,7 +155,7 @@ def fetch_text(
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 final_url = response.geturl()
                 host = (urllib.parse.urlsplit(final_url).hostname or "").lower()
-                if host not in {"ibkrcampus.com", "www.ibkrcampus.com"}:
+                if host not in ALLOWED_HOSTS:
                     raise SyncError(
                         f"unexpected redirect host for {url}: {host or '<empty>'}"
                     )
@@ -148,7 +170,7 @@ def fetch_text(
                 return FetchResult(final_url, text, content_type)
 
         except urllib.error.HTTPError as exc:
-            if exc.code in {404, 410}:
+            if exc.code in {403, 404, 410}:
                 raise
             last_error = exc
             if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
@@ -164,9 +186,9 @@ def fetch_text(
 def normalize_page_url(
     raw: str,
     *,
-    base_url: str = BASE_URL + UPSTREAM_PREFIX + "/",
+    base_url: str = UPSTREAM_ROOT + "/",
 ) -> str | None:
-    """Normalize an in-scope documentation page URL."""
+    """Normalize an in-scope documentation URL to the canonical current host."""
 
     value = html.unescape(raw.strip()).strip("<>")
     value = value.strip(chr(34)).strip(chr(39))
@@ -176,7 +198,7 @@ def normalize_page_url(
     joined = urllib.parse.urljoin(base_url, value)
     parsed = urllib.parse.urlsplit(joined)
     host = (parsed.hostname or "").lower()
-    if host not in {"ibkrcampus.com", "www.ibkrcampus.com"}:
+    if host not in ALLOWED_HOSTS:
         return None
 
     path = urllib.parse.unquote(parsed.path)
@@ -202,26 +224,23 @@ def normalize_page_url(
 
 
 def markdown_link_target(value: str) -> str:
-    """Strip the optional Markdown title from a link target."""
+    """Strip an optional Markdown link title."""
 
     target = value.strip()
     if target.startswith("<") and ">" in target:
         return target[1 : target.index(">")]
 
-    # Markdown permits URL plus a quoted title: url "title" or url 'title'.
     for marker in (' "', " '"):
         if marker in target:
             return target.split(marker, 1)[0]
     return target
 
 
-def extract_in_scope_links(
+def extract_markdown_links(
     text: str,
     *,
-    base_url: str = BASE_URL + UPSTREAM_PREFIX + "/",
+    base_url: str = UPSTREAM_ROOT + "/",
 ) -> set[str]:
-    """Extract canonical TWS API page URLs from Markdown or llms.txt content."""
-
     candidates: set[str] = set()
 
     for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", text):
@@ -236,16 +255,127 @@ def extract_in_scope_links(
         for match in re.findall(r"/docs/tws-api/[A-Za-z0-9_./%+\-]+", text)
     )
 
-    normalized: set[str] = set()
+    result: set[str] = set()
     for candidate in candidates:
         page = normalize_page_url(candidate, base_url=base_url)
         if page:
-            normalized.add(page)
-    return normalized
+            result.add(page)
+    return result
+
+
+def parse_html(html_text: str) -> BeautifulSoup:
+    return BeautifulSoup(html_text, "html.parser")
+
+
+def extract_html_links(
+    html_text: str,
+    *,
+    base_url: str,
+) -> set[str]:
+    soup = parse_html(html_text)
+    result: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        page = normalize_page_url(str(anchor.get("href")), base_url=base_url)
+        if page:
+            result.add(page)
+    return result
+
+
+def render_html_document(html_text: str, *, source_url: str) -> str:
+    """Extract the documentation article and convert it to deterministic Markdown."""
+
+    soup = parse_html(html_text)
+    container = soup.find("article")
+    if container is None:
+        container = soup.find("main")
+    if container is None:
+        raise SyncError(f"cannot locate article/main content in {source_url}")
+
+    for element in container.select(
+        "script,style,noscript,nav,aside,footer,header,form,button,svg"
+    ):
+        element.decompose()
+
+    rendered = html_to_markdown(
+        str(container),
+        heading_style="ATX",
+        bullets="-",
+        strip=["img"],
+    ).strip()
+
+    rendered = re.sub(r"\n[ \t]+\n", "\n\n", rendered)
+    rendered = re.sub(r"\n{4,}", "\n\n\n", rendered)
+
+    if len(rendered) < 80:
+        raise SyncError(f"converted article is unexpectedly short: {source_url}")
+
+    header = (
+        "<!-- AUTO-GENERATED IBKR DOCUMENTATION CACHE. DO NOT EDIT. -->\n"
+        f"<!-- Source: {source_url} -->\n"
+        "<!-- Source format: official HTML converted to Markdown. -->\n\n"
+    )
+    return header + rendered + "\n"
+
+
+def looks_like_markdown(text: str, content_type: str) -> bool:
+    stripped = text.lstrip()
+    prefix = stripped[:512].lower()
+    if not stripped:
+        return False
+    if "<html" in prefix or "<!doctype html" in prefix:
+        return False
+    if content_type == "text/html":
+        return False
+    return True
 
 
 def markdown_url(canonical_url: str) -> str:
     return canonical_url.rstrip("/") + ".md"
+
+
+def detect_official_markdown(*, timeout: float) -> bool:
+    """Probe once so a blocked Markdown host does not double every page request."""
+
+    probe = markdown_url(SEED_PAGES[0])
+    try:
+        result = fetch_text(probe, timeout=timeout, attempts=2)
+    except Exception:
+        return False
+    return looks_like_markdown(result.text, result.content_type)
+
+
+def fetch_document(
+    canonical_url: str,
+    *,
+    timeout: float,
+    prefer_markdown: bool,
+) -> DocumentResult:
+    if prefer_markdown:
+        try:
+            result = fetch_text(markdown_url(canonical_url), timeout=timeout)
+            if looks_like_markdown(result.text, result.content_type):
+                return DocumentResult(
+                    markdown=result.text.rstrip() + "\n",
+                    source_url=result.url,
+                    source_format="official_markdown",
+                    source_sha256=sha256_text(result.text),
+                    links=frozenset(
+                        extract_markdown_links(result.text, base_url=canonical_url)
+                    ),
+                )
+        except Exception:
+            pass
+
+    result = fetch_text(canonical_url, timeout=timeout)
+    links = extract_html_links(result.text, base_url=canonical_url)
+    markdown = render_html_document(result.text, source_url=canonical_url)
+    return DocumentResult(
+        markdown=markdown,
+        source_url=result.url,
+        source_format="html_to_markdown",
+        source_sha256=sha256_text(result.text),
+        links=frozenset(links),
+    )
 
 
 def local_relative_path(canonical_url: str) -> Path:
@@ -258,18 +388,6 @@ def local_relative_path(canonical_url: str) -> Path:
     if relative.is_absolute() or ".." in relative.parts:
         raise SyncError(f"unsafe local path from {canonical_url}: {relative}")
     return relative
-
-
-def looks_like_markdown(text: str, content_type: str) -> bool:
-    stripped = text.lstrip()
-    prefix = stripped[:512].lower()
-    if not stripped:
-        return False
-    if "<html" in prefix or "<!doctype html" in prefix:
-        return False
-    if content_type == "text/html" and ("<body" in prefix or "<head" in prefix):
-        return False
-    return True
 
 
 def load_manifest(path: Path = MANIFEST_PATH) -> dict | None:
@@ -354,8 +472,8 @@ def validate_removal_guard(
 def deterministic_manifest(documents: list[dict]) -> dict:
     docs = sorted(documents, key=lambda item: item["path"])
     return {
-        "schema_version": 1,
-        "source": BASE_URL + UPSTREAM_PREFIX,
+        "schema_version": 2,
+        "source": UPSTREAM_ROOT,
         "mirror_root": "docs/tws-api",
         "document_count": len(docs),
         "category_counts": category_counts(docs),
@@ -372,8 +490,6 @@ def write_json(path: Path, value: object) -> None:
 
 
 def publish_stage(stage_root: Path, manifest: dict) -> None:
-    """Materialize validated staged data into the git working tree."""
-
     stage_mirror = stage_root / "docs" / "tws-api"
     if not stage_mirror.is_dir():
         raise SyncError("staged mirror directory is missing")
@@ -392,16 +508,50 @@ def publish_stage(stage_root: Path, manifest: dict) -> None:
     write_json(
         SOURCE_PATH,
         {
-            "schema_version": 1,
-            "upstream": BASE_URL,
-            "scope": UPSTREAM_PREFIX,
+            "schema_version": 2,
+            "upstream": UPSTREAM_ROOT,
+            "canonical_host": BASE_URL,
             "discovery_indexes": list(INDEX_URLS),
             "storage_rule": (
-                "Preserve the official URL path under the repository root "
-                "and append .md"
+                "Preserve the official /docs/tws-api URL path under the "
+                "repository root and append .md"
+            ),
+            "fallback_rule": (
+                "Prefer official Markdown; when unavailable, convert the "
+                "canonical official HTML article to Markdown"
             ),
         },
     )
+
+
+def bootstrap_discovery(*, timeout: float) -> tuple[set[str], list[dict[str, str]]]:
+    """Discover the full navigation tree from canonical HTML and optional indexes."""
+
+    discovered: set[str] = set(SEED_PAGES)
+    warnings: list[dict[str, str]] = []
+
+    for index_url in INDEX_URLS:
+        try:
+            result = fetch_text(index_url, timeout=timeout)
+            discovered.update(
+                extract_markdown_links(result.text, base_url=index_url)
+            )
+        except Exception as exc:
+            warnings.append({"url": index_url, "reason": str(exc)})
+
+    successful_seed_html = 0
+    for seed in SEED_PAGES:
+        try:
+            result = fetch_text(seed, timeout=timeout)
+            successful_seed_html += 1
+            discovered.update(extract_html_links(result.text, base_url=seed))
+        except Exception as exc:
+            warnings.append({"url": seed, "reason": str(exc)})
+
+    if successful_seed_html == 0:
+        raise SyncError("none of the canonical TWS API seed pages could be fetched")
+
+    return discovered, warnings
 
 
 def sync(
@@ -412,42 +562,13 @@ def sync(
     minimum_pages: int,
     max_removal_ratio: float,
 ) -> dict:
-    """Crawl official Markdown docs and update the working tree if needed."""
-
-    discovered: set[str] = set(SEED_PAGES)
-    successful_indexes: list[str] = []
-    unavailable_indexes: list[dict[str, str]] = []
-
-    for index_url in INDEX_URLS:
-        try:
-            result = fetch_text(
-                index_url,
-                timeout=timeout,
-                max_bytes=24 * 1024 * 1024,
-            )
-        except urllib.error.HTTPError as exc:
-            if exc.code in {404, 410}:
-                unavailable_indexes.append(
-                    {"url": index_url, "reason": f"HTTP {exc.code}"}
-                )
-                continue
-            raise SyncError(
-                f"index fetch failed: {index_url}: HTTP {exc.code}"
-            ) from exc
-        except Exception as exc:
-            unavailable_indexes.append({"url": index_url, "reason": str(exc)})
-            continue
-
-        successful_indexes.append(index_url)
-        discovered.update(extract_in_scope_links(result.text, base_url=index_url))
-
-    if not successful_indexes:
-        raise SyncError("none of the official llms.txt index endpoints could be fetched")
+    discovered, discovery_warnings = bootstrap_discovery(timeout=timeout)
+    prefer_markdown = detect_official_markdown(timeout=timeout)
 
     queue = deque(sorted(discovered))
     queued = set(queue)
     documents: list[dict] = []
-    stale_index_pages: list[dict[str, str]] = []
+    stale_pages: list[dict[str, str]] = []
 
     with tempfile.TemporaryDirectory(
         prefix=".ibkr-docs-stage-",
@@ -456,51 +577,50 @@ def sync(
         stage_root = Path(temp_dir)
 
         while queue:
-            if len(documents) + len(stale_index_pages) >= max_pages:
+            if len(documents) + len(stale_pages) >= max_pages:
                 raise SyncError(
                     f"page limit {max_pages} reached; refusing a partial mirror"
                 )
 
             canonical_url = queue.popleft()
             relative_path = local_relative_path(canonical_url)
-            md_url = markdown_url(canonical_url)
 
             try:
-                result = fetch_text(md_url, timeout=timeout)
+                document = fetch_document(
+                    canonical_url,
+                    timeout=timeout,
+                    prefer_markdown=prefer_markdown,
+                )
             except urllib.error.HTTPError as exc:
-                if exc.code in {404, 410}:
-                    stale_index_pages.append(
+                if exc.code in {403, 404, 410}:
+                    stale_pages.append(
                         {"url": canonical_url, "reason": f"HTTP {exc.code}"}
                     )
                     continue
+                raise
+            except Exception as exc:
                 raise SyncError(
-                    f"document fetch failed: {md_url}: HTTP {exc.code}"
+                    f"failed to fetch document {canonical_url}: {exc}"
                 ) from exc
-
-            if not looks_like_markdown(result.text, result.content_type):
-                raise SyncError(
-                    f"expected Markdown but received unexpected content: {md_url}"
-                )
-            if len(result.text.strip()) < 16:
-                raise SyncError(f"unexpectedly short document: {md_url}")
 
             target = stage_root / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(result.text, encoding="utf-8")
+            target.write_text(document.markdown, encoding="utf-8")
 
             documents.append(
                 {
                     "path": relative_path.as_posix(),
                     "url": canonical_url,
-                    "markdown_url": md_url,
-                    "sha256": sha256_text(result.text),
-                    "bytes": len(result.text.encode("utf-8")),
+                    "official_markdown_url": markdown_url(canonical_url),
+                    "source_url": document.source_url,
+                    "source_format": document.source_format,
+                    "source_sha256": document.source_sha256,
+                    "sha256": sha256_text(document.markdown),
+                    "bytes": len(document.markdown.encode("utf-8")),
                 }
             )
 
-            for linked in sorted(
-                extract_in_scope_links(result.text, base_url=canonical_url)
-            ):
+            for linked in sorted(document.links):
                 if linked not in queued:
                     queued.add(linked)
                     queue.append(linked)
@@ -529,15 +649,15 @@ def sync(
         "changed": changed,
         "document_count": len(documents),
         "category_counts": manifest["category_counts"],
-        "successful_indexes": successful_indexes,
-        "unavailable_indexes": unavailable_indexes,
-        "stale_index_pages": stale_index_pages,
+        "preferred_source_format": (
+            "official_markdown" if prefer_markdown else "html_to_markdown"
+        ),
+        "discovery_warnings": discovery_warnings,
+        "stale_pages": stale_pages,
     }
 
 
 def validate_existing(*, minimum_pages: int = DEFAULT_MIN_PAGES) -> dict:
-    """Validate the committed mirror against its manifest."""
-
     manifest = load_manifest()
     if not manifest:
         raise SyncError(f"manifest is missing: {MANIFEST_PATH}")
@@ -607,7 +727,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_parser = subparsers.add_parser(
         "sync",
-        help="download and publish the official mirror",
+        help="download and stage the official mirror",
     )
     sync_parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     sync_parser.add_argument(

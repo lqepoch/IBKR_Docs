@@ -11,6 +11,7 @@ on:
     paths:
       - "scripts/**"
       - "tests/**"
+      - "requirements.txt"
       - ".github/workflows/sync-ibkr-docs.yml"
 
 permissions:
@@ -41,6 +42,9 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install mirror dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
@@ -67,7 +71,7 @@ jobs:
           {
             echo "## IBKR documentation sync"
             echo
-            echo "- Upstream: https://ibkrcampus.com/docs/tws-api"
+            echo "- Upstream: https://www.interactivebrokers.com/docs/tws-api"
             echo "- Repository path: docs/tws-api/"
             echo "- Schedule: Sunday 01:17 UTC (09:17 UTC+8)"
             echo

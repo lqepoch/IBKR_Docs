@@ -14,18 +14,26 @@ SPEC.loader.exec_module(sync)
 
 
 class NormalizeUrlTests(unittest.TestCase):
-    def test_absolute_page(self) -> None:
+    def test_absolute_current_page(self) -> None:
         self.assertEqual(
             sync.normalize_page_url(
-                "https://ibkrcampus.com/docs/tws-api/doc/introduction#section"
+                "https://www.interactivebrokers.com/docs/tws-api/doc/introduction#section"
             ),
-            "https://ibkrcampus.com/docs/tws-api/doc/introduction",
+            "https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
+        )
+
+    def test_legacy_host_is_canonicalized(self) -> None:
+        self.assertEqual(
+            sync.normalize_page_url(
+                "https://ibkrcampus.com/docs/tws-api/ref/contract.md"
+            ),
+            "https://www.interactivebrokers.com/docs/tws-api/ref/contract",
         )
 
     def test_relative_page(self) -> None:
         self.assertEqual(
             sync.normalize_page_url("/docs/tws-api/ref/contract.md"),
-            "https://ibkrcampus.com/docs/tws-api/ref/contract",
+            "https://www.interactivebrokers.com/docs/tws-api/ref/contract",
         )
 
     def test_out_of_scope(self) -> None:
@@ -42,38 +50,72 @@ class NormalizeUrlTests(unittest.TestCase):
 
 
 class LinkExtractionTests(unittest.TestCase):
-    def test_extracts_markdown_absolute_and_raw_paths(self) -> None:
+    def test_extracts_markdown_links(self) -> None:
         text_value = """
         [Intro](/docs/tws-api/doc/introduction)
-        https://ibkrcampus.com/docs/tws-api/ref/contract.md
+        https://www.interactivebrokers.com/docs/tws-api/ref/contract.md
         /docs/tws-api/protobuf/introduction
         https://example.com/not-in-scope
         """
         self.assertEqual(
-            sync.extract_in_scope_links(text_value),
+            sync.extract_markdown_links(text_value),
             {
-                "https://ibkrcampus.com/docs/tws-api/doc/introduction",
-                "https://ibkrcampus.com/docs/tws-api/ref/contract",
-                "https://ibkrcampus.com/docs/tws-api/protobuf/introduction",
+                "https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
+                "https://www.interactivebrokers.com/docs/tws-api/ref/contract",
+                "https://www.interactivebrokers.com/docs/tws-api/protobuf/introduction",
             },
         )
 
-    def test_relative_link_uses_page_base(self) -> None:
+    def test_extracts_html_links(self) -> None:
+        html_value = """
+        <html><body>
+          <a href="/docs/tws-api/doc/quick-start/order-id">Order ID</a>
+          <a href="https://ibkrcampus.com/docs/tws-api/ref/order.md">Order</a>
+          <a href="/docs/web-api/introduction">Other API</a>
+        </body></html>
+        """
         self.assertEqual(
-            sync.extract_in_scope_links(
-                "[Contract](../ref/contract)",
-                base_url="https://ibkrcampus.com/docs/tws-api/doc/introduction",
+            sync.extract_html_links(
+                html_value,
+                base_url="https://www.interactivebrokers.com/docs/tws-api/doc/introduction",
             ),
-            {"https://ibkrcampus.com/docs/tws-api/ref/contract"},
+            {
+                "https://www.interactivebrokers.com/docs/tws-api/doc/quick-start/order-id",
+                "https://www.interactivebrokers.com/docs/tws-api/ref/order",
+            },
         )
 
     def test_local_path_preserves_upstream_tree(self) -> None:
         self.assertEqual(
             sync.local_relative_path(
-                "https://ibkrcampus.com/docs/tws-api/doc/market-data/historical-data"
+                "https://www.interactivebrokers.com/docs/tws-api/doc/market-data/historical-data"
             ).as_posix(),
             "docs/tws-api/doc/market-data/historical-data.md",
         )
+
+
+class HtmlConversionTests(unittest.TestCase):
+    def test_article_conversion_excludes_navigation(self) -> None:
+        html_value = """
+        <html><body>
+          <nav>Navigation noise</nav>
+          <main>
+            <article>
+              <h1>Place Order</h1>
+              <p>Submit an <code>Order</code> object.</p>
+              <pre><code>client.placeOrder(order_id, contract, order)</code></pre>
+            </article>
+          </main>
+        </body></html>
+        """
+        rendered = sync.render_html_document(
+            html_value,
+            source_url="https://www.interactivebrokers.com/docs/tws-api/doc/orders/place-order",
+        )
+        self.assertIn("# Place Order", rendered)
+        self.assertIn("Order", rendered)
+        self.assertIn("client.placeOrder", rendered)
+        self.assertNotIn("Navigation noise", rendered)
 
 
 class ManifestTests(unittest.TestCase):
@@ -82,14 +124,20 @@ class ManifestTests(unittest.TestCase):
             {
                 "path": "docs/tws-api/ref/z.md",
                 "url": "u2",
-                "markdown_url": "m2",
+                "official_markdown_url": "m2",
+                "source_url": "s2",
+                "source_format": "html_to_markdown",
+                "source_sha256": "2",
                 "sha256": "b",
                 "bytes": 2,
             },
             {
                 "path": "docs/tws-api/doc/a.md",
                 "url": "u1",
-                "markdown_url": "m1",
+                "official_markdown_url": "m1",
+                "source_url": "s1",
+                "source_format": "html_to_markdown",
+                "source_sha256": "1",
                 "sha256": "a",
                 "bytes": 1,
             },
